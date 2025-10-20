@@ -1,18 +1,23 @@
-# mixtli-transfer-we-backend (Render)
-API Express para presign (PUT) y firmas de descarga (GET) contra S3/R2.
+# Mixtli Transfer — Backend Drop-in (Render)
+Todo se controla por variables de entorno (sin tocar código).
 
-## Deploy en Render
-- Build: `npm install --no-audit --no-fund`
+## Variables mínimas
+- `ALLOWED_ORIGINS` (JSON array)
+- `URL_TTL_SECONDS` (segundos; 432000 = 5 días)
+- Límites por plan:
+  - O usa `PLAN_LIMITS_JSON={"free":"4GB","pro":"200GB","promax":"300GB"}`
+  - O usa `FREE_MAX_FILE_BYTES` / `PRO_MAX_FILE_BYTES` / `PROMAX_MAX_FILE_BYTES`
+- `ENABLE_PLAN_HEADER=true` para leer `x-mixtli-plan` (free/pro/promax). Si `false`, usa `DEFAULT_PLAN`.
+- S3/R2: `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`.
+
+## CORS
+Agrega tu dominio de Netlify en `ALLOWED_ORIGINS`.
+
+## Deploy
+- Build: (Render auto) `npm install`
 - Start: `node server.js`
-- Node >= 20
-- Variables de entorno: ver `.env.example`
+- Probar: `GET /api/health`
 
-## Importante
-- `URL_TTL_SECONDS=86400` → enlaces válidos por 1 día
-- `ALLOWED_ORIGINS` → agrega el dominio de tu nuevo sitio de Netlify
-- `MAX_FILE_BYTES` → ajusta para Free/Pro/Pro Max (ej. 2GB / 5GB / 10GB)
-
-## Endpoints
-- `GET /api/health`
-- `POST /api/presign`  body: `{ filename, size, contentType }`
-- `GET /api/sign-get?key=...`
+## Notas
+- Tamaños como "4GB" o "200 GB" son válidos en `PLAN_LIMITS_JSON`.
+- Si no mandas header y `ENABLE_PLAN_HEADER=true`, usa `DEFAULT_PLAN=free`.
