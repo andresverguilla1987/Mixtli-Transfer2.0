@@ -1,12 +1,17 @@
-# Mixtli Backend 3.0 (Multipart)
-- Reemplaza tu `server.js` por `server_multipart.js` (o renómbralo a `server.js`).
-- ENV necesarias: mismas de antes (S3_* y ALLOWED_ORIGINS). Opcionales para multipart:
-```
-ENABLE_MULTIPART=true
-MULTIPART_PART_SIZE=16MB
-```
-- Endpoints nuevos:
-  - POST `/api/multipart/create` → `{ uploadId, key, partSize }`
-  - POST `/api/multipart/part-url` → `{ url }` (por `partNumber`)
-  - POST `/api/multipart/complete` → `{ ok, key, location }`
-  - POST `/api/multipart/abort` → `{ ok: true }`
+# Backend 3.1 (ZIP Bundle streaming)
+Requiere añadir dependencia:
+  npm i archiver
+
+Endpoint:
+GET /api/bundle?m=<manifestKey>
+
+Donde <manifestKey> es el objeto JSON en tu bucket con la estructura:
+{
+  "name": "combo.zip",
+  "items": [
+    { "key": "uploads/2025/10/20/uuid-foto1.png", "name": "foto1.png" },
+    { "key": "uploads/2025/10/20/uuid-video.mp4" }
+  ]
+}
+
+El servidor lee el manifiesto directo del bucket y **streamea** el ZIP sin cargarlo en memoria.
