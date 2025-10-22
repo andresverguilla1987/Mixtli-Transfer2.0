@@ -3,9 +3,6 @@
   "version": "2.1.0-debug",
   "type": "module",
   "main": "server.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
