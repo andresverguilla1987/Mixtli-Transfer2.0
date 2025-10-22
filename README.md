@@ -1,14 +1,9 @@
-# Mixtli Transfer Backend v2.0
+# Mixtli Transfer Backend v2.1-debug
+- /api/debug/env: revisa configuración (sin exponer secretos).
+- /api/presign: errores detallados (hint para "Invalid URL").
 
-Minimal presigned S3/R2 backend for direct browser uploads.
-
-## Quick Start (Render)
-1) New Web Service → Node 18+.
-2) Build command: `npm install --no-audit --no-fund`
-3) Start command: `node server.js`
-4) Add env vars from `.env.example` (fill values).
-5) Open `/api/health`.
-
-### Important
-- `ALLOWED_ORIGINS` **must** include your Netlify origin(s).
-- Use `PUBLIC_BASE_URL` only if your bucket is public / behind a CDN. Otherwise, the frontend can call `/api/presign-get` per object to get a temporary GET URL.
+Problema común "Invalid URL":
+- S3_ENDPOINT debe ser el endpoint de la cuenta, **sin** nombre del bucket al final, ej.:
+  https://8351c372dedf0e354a3196aff085f0ae.r2.cloudflarestorage.com
+- El nombre del bucket va en S3_BUCKET, ej.: mixtlitransfer
+- PUBLIC_BASE_URL (opcional) sí puede llevar /<bucket>
