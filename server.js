@@ -44,7 +44,11 @@ const s3 = new AWS.S3({
 const BUCKET = process.env.S3_BUCKET;
 if(!BUCKET){ throw new Error('S3_BUCKET no definido'); }
 
-const PUBLIC_BASE = process.env.PUBLIC_BASE || null;
+// Acepta PUBLIC_BASE o PUBLIC_BASE_URL (fallback)
+const PUBLIC_BASE = (process.env.PUBLIC_BASE && process.env.PUBLIC_BASE.trim()) ||
+                    (process.env.PUBLIC_BASE_URL && process.env.PUBLIC_BASE_URL.trim()) ||
+                    null;
+
 const DEFAULT_TTL = parseInt(process.env.LINK_TTL_DAYS||'7',10);
 
 // ---- Helpers ----
@@ -61,11 +65,6 @@ async function headObject(Key){
 
 async function getObjectStream(Key){
   return s3.getObject({ Bucket: BUCKET, Key }).createReadStream();
-}
-
-async function listObjects(prefix){
-  const out = await s3.listObjectsV2({ Bucket: BUCKET, Prefix: prefix }).promise();
-  return out.Contents || [];
 }
 
 // ---- Routes ----
@@ -99,7 +98,7 @@ app.post('/api/transfers', upload.array('files', 50), async (req, res)=>{
 
     const manifest = {
       id,
-      version: '2.3',
+      version: '2.3.1',
       createdAt: toRFC3339(createdAt),
       expiresAt: toRFC3339(expiresAt),
       totalBytes: total,
@@ -109,10 +108,11 @@ app.post('/api/transfers', upload.array('files', 50), async (req, res)=>{
 
     await putObject(`transfers/${id}/manifest.json`, Buffer.from(JSON.stringify(manifest,null,2)), 'application/json');
 
-    const backendBase = `${req.protocol}://${req.get('host')}`;
+    // Build links: prefer PUBLIC_BASE; fallback to request host
     const viewPath = `/t/${id}`;
+    const backendBase = `${req.protocol}://${req.get('host')}`;
     const link = backendBase + viewPath;
-    const publicLink = PUBLIC_BASE ? `${PUBLIC_BASE}${viewPath}` : null;
+    const publicLink = PUBLIC_BASE ? `${PUBLIC_BASE}${viewPath}` : link;
 
     res.json({ id, link, publicLink, expiresInDays, count: items.length, totalBytes: total });
   }catch(err){
@@ -248,7 +248,7 @@ ${manifest.files.map(f=>`
 `).join('')}
 </div>
 ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transfers/${id}/download.zip">Descargar todo (ZIP)</a></div>` }
-<div class="footer">Mixtli Transfer v2.3 — compartido vía link único.</div>
+<div class="footer">Mixtli Transfer v2.3.1 — compat: PUBLIC_BASE / PUBLIC_BASE_URL.</div>
 </div></div></body></html>`;
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -259,5 +259,5 @@ ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transf
 });
 
 app.listen(PORT, ()=>{
-  console.log('Mixtli Transfer backend v2.3 listening on', PORT);
+  console.log('Mixtli Transfer backend v2.3.1 listening on', PORT);
 });
