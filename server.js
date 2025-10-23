@@ -1,10 +1,17 @@
-// server.js — Mixtli Transfer v2.3.2 (R2 fixes + selftest)
+// server.js — Mixtli Transfer v2.3.3 (R2 con AWS SDK v3, fixes + selftest)
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import { nanoid } from 'nanoid';
-import AWS from 'aws-sdk';
+import {
+  S3Client,
+  PutObjectCommand,
+  HeadObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand
+} from '@aws-sdk/client-s3';
 import archiver from 'archiver';
 
 dotenv.config();
@@ -31,11 +38,11 @@ app.use(corsCheck);
 app.options('*', corsCheck);
 app.use(express.json());
 
-// Para que los links salgan en https detrás de Render/Proxies
+// Para que los links salgan con https detrás de Render/Proxies
 app.set('trust proxy', true);
 
 /* ----------------------------------------------------------------------
- *  Multer (memoria) — tamaños máximos
+ *  Multer (memoria) — límites
  * -------------------------------------------------------------------- */
 const MAX_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '2000', 10);
 const MAX_FILES = parseInt(process.env.MAX_FILE_COUNT || '50', 10);
@@ -45,44 +52,39 @@ const upload = multer({
 });
 
 /* ----------------------------------------------------------------------
- *  Cloudflare R2 (AWS SDK v2 - S3 compatible)
+ *  Cloudflare R2 — AWS SDK v3 (S3 compatible)
  * -------------------------------------------------------------------- */
-// Acepta nombres alternos por si el panel usó KEY / SECRET
-const ACCESS_KEY_ID =
-  process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || '';
-const SECRET_ACCESS_KEY =
-  process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || '';
-
-if (!ACCESS_KEY_ID || !SECRET_ACCESS_KEY) {
-  console.warn('[WARN] Faltan credenciales S3 (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).');
-}
-
-// Normaliza endpoint: acepta 'https://host', 'host', o 'https://host/bucket' y deja solo host
+// Normaliza endpoint: acepta 'https://host', 'host' o 'https://host/bucket' y deja solo host
 function normalizeEndpoint(ep) {
   if (!ep) return null;
   try {
     const url = ep.startsWith('http') ? new URL(ep) : new URL('https://' + ep);
-    return `https://${url.hostname}`; // sin pathname ni bucket
+    return `https://${url.hostname}`; // sin pathname/bucket
   } catch {
     const host = String(ep).replace(/^https?:\/\//i, '').split('/')[0].trim();
     return host ? `https://${host}` : null;
   }
 }
 const ENDPOINT_URL = normalizeEndpoint(process.env.S3_ENDPOINT);
+console.log('[BOOT] S3_ENDPOINT =', process.env.S3_ENDPOINT || '(undefined)');
+if (!ENDPOINT_URL) throw new Error('S3_ENDPOINT no definido o inválido (usa https://<account>.r2.cloudflarestorage.com)');
 
-const S3_REGION = (process.env.S3_REGION || 'auto');
+const S3_REGION = process.env.S3_REGION || 'auto';
 const FORCE_PATH = String(process.env.S3_FORCE_PATH_STYLE || 'true') === 'true';
+const ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || '';
+const SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || '';
 const BUCKET = process.env.S3_BUCKET;
-if (!BUCKET) { throw new Error('S3_BUCKET no definido'); }
+if (!BUCKET) throw new Error('S3_BUCKET no definido');
+if (!ACCESS_KEY_ID || !SECRET_ACCESS_KEY) console.warn('[WARN] Faltan credenciales S3');
 
-const s3 = new AWS.S3({
-  accessKeyId: ACCESS_KEY_ID,
-  secretAccessKey: SECRET_ACCESS_KEY,
-  endpoint: ENDPOINT_URL,       // <- limpio, sólo host
-  region: S3_REGION,            // <- 'auto' para R2
-  signatureVersion: 'v4',
-  s3ForcePathStyle: FORCE_PATH, // <- obligatorio en R2
-  sslEnabled: true
+const s3 = new S3Client({
+  endpoint: ENDPOINT_URL,               // p. ej. https://<account>.r2.cloudflarestorage.com
+  region: S3_REGION,                    // R2 acepta 'auto'
+  forcePathStyle: FORCE_PATH,           // obligatorio en R2
+  credentials: {
+    accessKeyId: ACCESS_KEY_ID,
+    secretAccessKey: SECRET_ACCESS_KEY
+  }
 });
 
 // PUBLIC_BASE o PUBLIC_BASE_URL para “link público” del share (opcional)
@@ -93,101 +95,124 @@ const PUBLIC_BASE = (process.env.PUBLIC_BASE && process.env.PUBLIC_BASE.trim())
 const DEFAULT_TTL = parseInt(process.env.LINK_TTL_DAYS || '7', 10);
 
 /* ----------------------------------------------------------------------
- *  Utils S3
+ *  Utils
  * -------------------------------------------------------------------- */
 const safeName = (name) => name.replace(/[\\#?<>:*|"\x00-\x1F]/g, '_');
 const toRFC3339 = (d) => d.toISOString();
 
 async function putObject(Key, Body, ContentType) {
-  await s3.putObject({ Bucket: BUCKET, Key, Body, ContentType }).promise();
+  await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key, Body, ContentType }));
 }
-
 async function headObject(Key) {
   try {
-    return await s3.headObject({ Bucket: BUCKET, Key }).promise();
+    return await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key }));
   } catch (e) {
-    if (e && (e.code === 'NotFound' || e.statusCode === 404)) return null;
+    if (e?.$metadata?.httpStatusCode === 404 || e?.name === 'NotFound') return null;
     throw e;
   }
 }
-
 async function getObjectStream(Key) {
-  return s3.getObject({ Bucket: BUCKET, Key }).createReadStream();
+  const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key }));
+  return r.Body; // stream
 }
 
 function mapS3Error(err) {
-  const code = (err && (err.code || err.name)) || '';
+  const code = err?.code || err?.name || '';
   const msg  = err?.message || '';
-
-  // credenciales/firma
   if (code === 'CredentialsError' || code === 'InvalidAccessKeyId' || code === 'ExpiredToken') {
-    return { status: 401, body: { error: 'Unauthorized', hint: 'Revisa AccessKey/Secret del R2 API Token (no Global API Key)' } };
+    return { status: 401, body: { error: 'Unauthorized', hint: 'R2 API Token incorrecto' } };
   }
   if (code === 'SignatureDoesNotMatch' || code === 'AccessDenied') {
-    return { status: 401, body: { error: 'Unauthorized', hint: 'Asegura endpoint sin /bucket, region=auto, path-style=true' } };
+    return { status: 401, body: { error: 'Unauthorized', hint: 'Endpoint sin /bucket, region=auto, path-style=true' } };
   }
   if (code === 'Forbidden') {
-    return { status: 403, body: { error: 'Forbidden', hint: 'Token sin permisos suficientes (Bucket/Object read/write/list/delete)' } };
+    return { status: 403, body: { error: 'Forbidden', hint: 'Faltan permisos (Bucket/Object RWLD)' } };
   }
   if (code === 'NoSuchBucket') {
-    return { status: 404, body: { error: 'no_such_bucket', hint: `Bucket "${BUCKET}" inexistente o mal escrito` } };
+    return { status: 404, body: { error: 'no_such_bucket', hint: `Bucket "${BUCKET}" no existe o está mal escrito` } };
   }
   return { status: 500, body: { error: 's3_error', code, message: msg } };
 }
 
 /* ----------------------------------------------------------------------
- *  Rutas
+ *  Portada (opcional) y Salud
  * -------------------------------------------------------------------- */
-// Salud
+app.get('/', (req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="es"><head><meta charset="utf-8"/>
+<title>Mixtli Transfer API</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto;background:#0f1117;color:#e5e9f3;padding:24px}
+  a{color:#7c5cff;text-decoration:none}
+  .card{max-width:720px;background:#151923;border:1px solid #23283a;border-radius:14px;padding:20px}
+  .muted{color:#a8b3cf}
+  code{background:#0f1423;padding:2px 6px;border-radius:6px}
+</style></head>
+<body>
+  <div class="card">
+    <h1>Mixtli Transfer — API</h1>
+    <p class="muted">Backend vivo. Rutas útiles:</p>
+    <ul>
+      <li><a href="/api/health">/api/health</a></li>
+      <li><a href="/api/r2-selftest">/api/r2-selftest</a> (prueba credenciales R2)</li>
+      <li><code>POST /api/transfers</code> (subir archivos con <code>multipart/form-data</code>)</li>
+      <li><code>GET /t/:id</code> (vista pública de un bundle)</li>
+    </ul>
+  </div>
+</body></html>`);
+});
+
 app.get('/api/health', (req, res) =>
   res.json({
     ok: true,
     time: new Date().toISOString(),
     bucket: BUCKET,
-    endpoint: ENDPOINT_URL || null,
+    endpoint: ENDPOINT_URL,
     region: S3_REGION,
     forcePathStyle: FORCE_PATH
   })
 );
 
-// Diagnóstico de S3/R2 sin escribir (requiere permiso List)
+/* ----------------------------------------------------------------------
+ *  Diag & Self-Test
+ * -------------------------------------------------------------------- */
 app.get('/api/diag/s3', async (req, res) => {
   try {
-    const data = await s3.listObjectsV2({ Bucket: BUCKET, MaxKeys: 1, Prefix: 'transfers/' }).promise();
-    res.json({ ok: true, count: data.KeyCount ?? 0 });
+    const data = await s3.send(new ListObjectsV2Command({
+      Bucket: BUCKET, MaxKeys: 1, Prefix: 'transfers/'
+    }));
+    res.json({ ok: true, count: data?.KeyCount || 0 });
   } catch (err) {
     const m = mapS3Error(err);
     res.status(m.status).json(m.body);
   }
 });
 
-// Self-test completo: headBucket + put + delete
 app.get('/api/r2-selftest', async (req, res) => {
   try {
-    await s3.headBucket({ Bucket: BUCKET }).promise();
+    // Head "suave" de un objeto (si no existe, no es error fatal)
+    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: '__check__' })).catch(()=>{});
+    // Put/Delete de prueba
     const testKey = `__selftest__/t-${Date.now()}.txt`;
-    await s3.putObject({ Bucket: BUCKET, Key: testKey, Body: 'ok-mixtli', ContentType: 'text/plain' }).promise();
-    await s3.deleteObject({ Bucket: BUCKET, Key: testKey }).promise();
-    res.json({
-      ok: true,
-      message: 'R2 credentials & config OK',
-      config: { endpoint: ENDPOINT_URL, region: S3_REGION, forcePathStyle: FORCE_PATH, bucket: BUCKET }
-    });
+    await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: testKey, Body: 'ok-mixtli', ContentType: 'text/plain' }));
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: testKey }));
+    res.json({ ok: true, message: 'R2 v3 OK', endpoint: ENDPOINT_URL });
   } catch (err) {
-    const meta = { name: err?.name, code: err?.code, status: err?.statusCode, message: err?.message };
-    console.error('R2 SELFTEST ERROR:', meta);
     const m = mapS3Error(err);
-    res.status(m.status).json({ ...m.body, meta });
+    res.status(m.status).json({
+      ...m.body,
+      meta: { name: err?.name, code: err?.code, status: err?.$metadata?.httpStatusCode, msg: err?.message }
+    });
   }
 });
 
-// Crear transfer (multi-archivo, un solo link)
+/* ----------------------------------------------------------------------
+ *  Transfers
+ * -------------------------------------------------------------------- */
 app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) => {
   try {
     const files = req.files || [];
-    if (files.length === 0) {
-      return res.status(400).json({ error: 'No files' });
-    }
+    if (!files.length) return res.status(400).json({ error: 'No files' });
 
     const expiresInDays = Math.max(1, Math.min(30,
       parseInt(req.body.expiresInDays || String(DEFAULT_TTL), 10)
@@ -203,17 +228,12 @@ app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) =>
       const key = `transfers/${id}/${safeName(f.originalname)}`;
       await putObject(key, f.buffer, f.mimetype || 'application/octet-stream');
       total += f.size;
-      items.push({
-        name: f.originalname,
-        size: f.size,
-        type: f.mimetype || 'application/octet-stream',
-        key
-      });
+      items.push({ name: f.originalname, size: f.size, type: f.mimetype || 'application/octet-stream', key });
     }
 
     const manifest = {
       id,
-      version: '2.3.2',
+      version: '2.3.3',
       createdAt: toRFC3339(createdAt),
       expiresAt: toRFC3339(expiresAt),
       totalBytes: total,
@@ -221,11 +241,7 @@ app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) =>
       files: items.map(i => ({ name: i.name, size: i.size, type: i.type }))
     };
 
-    await putObject(
-      `transfers/${id}/manifest.json`,
-      Buffer.from(JSON.stringify(manifest, null, 2)),
-      'application/json'
-    );
+    await putObject(`transfers/${id}/manifest.json`, Buffer.from(JSON.stringify(manifest, null, 2)), 'application/json');
 
     const viewPath = `/t/${id}`;
     const scheme = req.headers['x-forwarded-proto'] || req.protocol;
@@ -242,7 +258,9 @@ app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) =>
   }
 });
 
-// Obtener manifest (con caducidad)
+/* ----------------------------------------------------------------------
+ *  Manifest y Descargas
+ * -------------------------------------------------------------------- */
 app.get('/api/transfers/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -265,7 +283,6 @@ app.get('/api/transfers/:id', async (req, res) => {
   }
 });
 
-// Descargar archivo individual
 app.get('/api/file/:id/:name', async (req, res) => {
   try {
     const { id, name } = req.params;
@@ -293,7 +310,6 @@ app.get('/api/file/:id/:name', async (req, res) => {
   }
 });
 
-// Descargar ZIP de todo
 app.get('/api/transfers/:id/download.zip', async (req, res) => {
   try {
     const { id } = req.params;
@@ -328,7 +344,9 @@ app.get('/api/transfers/:id/download.zip', async (req, res) => {
   }
 });
 
-// Página mínima de share
+/* ----------------------------------------------------------------------
+ *  Share page
+ * -------------------------------------------------------------------- */
 app.get('/t/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -373,9 +391,8 @@ ${manifest.files.map(f=>`
 `).join('')}
 </div>
 ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transfers/${id}/download.zip">Descargar todo (ZIP)</a></div>` }
-<div class="footer">Mixtli Transfer v2.3.2 — compat: PUBLIC_BASE / PUBLIC_BASE_URL.</div>
+<div class="footer">Mixtli Transfer v2.3.3 — compat: PUBLIC_BASE / PUBLIC_BASE_URL.</div>
 </div></div></body></html>`;
-
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
   } catch (err) {
@@ -385,5 +402,5 @@ ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transf
 });
 
 app.listen(PORT, () => {
-  console.log('Mixtli Transfer backend v2.3.2 listening on', PORT);
+  console.log('Mixtli Transfer backend v2.3.3 listening on', PORT);
 });
