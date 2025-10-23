@@ -1,3 +1,4 @@
+// server.js — Mixtli Transfer v2.3.2 (R2 fixes + selftest)
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -11,7 +12,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-/* ----------------------------- CORS seguro ----------------------------- */
+/* ----------------------------------------------------------------------
+ *  Seguridad CORS
+ * -------------------------------------------------------------------- */
 const ORIGINS = (() => {
   try { return JSON.parse(process.env.ALLOWED_ORIGINS || '[]'); }
   catch { return []; }
@@ -25,10 +28,15 @@ const corsCheck = cors({
   credentials: true
 });
 app.use(corsCheck);
-app.options('*', corsCheck); // preflight
+app.options('*', corsCheck);
 app.use(express.json());
 
-/* -------------------------- Multer (mem. buffer) ----------------------- */
+// Para que los links salgan en https detrás de Render/Proxies
+app.set('trust proxy', true);
+
+/* ----------------------------------------------------------------------
+ *  Multer (memoria) — tamaños máximos
+ * -------------------------------------------------------------------- */
 const MAX_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '2000', 10);
 const MAX_FILES = parseInt(process.env.MAX_FILE_COUNT || '50', 10);
 const upload = multer({
@@ -36,7 +44,9 @@ const upload = multer({
   limits: { fileSize: MAX_MB * 1024 * 1024, files: MAX_FILES }
 });
 
-/* --------------------------- S3 (Cloudflare R2) ------------------------ */
+/* ----------------------------------------------------------------------
+ *  Cloudflare R2 (AWS SDK v2 - S3 compatible)
+ * -------------------------------------------------------------------- */
 // Acepta nombres alternos por si el panel usó KEY / SECRET
 const ACCESS_KEY_ID =
   process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || '';
@@ -47,37 +57,48 @@ if (!ACCESS_KEY_ID || !SECRET_ACCESS_KEY) {
   console.warn('[WARN] Faltan credenciales S3 (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).');
 }
 
-const ENDPOINT_HOST = String(process.env.S3_ENDPOINT || '')
-  .replace(/^https?:\/\//i, '')
-  .trim();
-const ENDPOINT_URL = ENDPOINT_HOST ? `https://${ENDPOINT_HOST}` : undefined;
+// Normaliza endpoint: acepta 'https://host', 'host', o 'https://host/bucket' y deja solo host
+function normalizeEndpoint(ep) {
+  if (!ep) return null;
+  try {
+    const url = ep.startsWith('http') ? new URL(ep) : new URL('https://' + ep);
+    return `https://${url.hostname}`; // sin pathname ni bucket
+  } catch {
+    const host = String(ep).replace(/^https?:\/\//i, '').split('/')[0].trim();
+    return host ? `https://${host}` : null;
+  }
+}
+const ENDPOINT_URL = normalizeEndpoint(process.env.S3_ENDPOINT);
+
+const S3_REGION = (process.env.S3_REGION || 'auto');
+const FORCE_PATH = String(process.env.S3_FORCE_PATH_STYLE || 'true') === 'true';
+const BUCKET = process.env.S3_BUCKET;
+if (!BUCKET) { throw new Error('S3_BUCKET no definido'); }
 
 const s3 = new AWS.S3({
   accessKeyId: ACCESS_KEY_ID,
   secretAccessKey: SECRET_ACCESS_KEY,
-  endpoint: ENDPOINT_URL,        // R2
-  region: process.env.S3_REGION || 'auto',
+  endpoint: ENDPOINT_URL,       // <- limpio, sólo host
+  region: S3_REGION,            // <- 'auto' para R2
   signatureVersion: 'v4',
-  s3ForcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || 'true') === 'true',
+  s3ForcePathStyle: FORCE_PATH, // <- obligatorio en R2
   sslEnabled: true
 });
 
-const BUCKET = process.env.S3_BUCKET;
-if (!BUCKET) { throw new Error('S3_BUCKET no definido'); }
-
-// PUBLIC_BASE o PUBLIC_BASE_URL
+// PUBLIC_BASE o PUBLIC_BASE_URL para “link público” del share (opcional)
 const PUBLIC_BASE = (process.env.PUBLIC_BASE && process.env.PUBLIC_BASE.trim())
   || (process.env.PUBLIC_BASE_URL && process.env.PUBLIC_BASE_URL.trim())
   || null;
 
 const DEFAULT_TTL = parseInt(process.env.LINK_TTL_DAYS || '7', 10);
 
-/* -------------------------------- Utils -------------------------------- */
+/* ----------------------------------------------------------------------
+ *  Utils S3
+ * -------------------------------------------------------------------- */
 const safeName = (name) => name.replace(/[\\#?<>:*|"\x00-\x1F]/g, '_');
 const toRFC3339 = (d) => d.toISOString();
 
 async function putObject(Key, Body, ContentType) {
-  // R2 NO acepta ACL: 'private'
   await s3.putObject({ Bucket: BUCKET, Key, Body, ContentType }).promise();
 }
 
@@ -95,28 +116,37 @@ async function getObjectStream(Key) {
 }
 
 function mapS3Error(err) {
-  // Errores típicos de credencial/permiso en R2
-  const code = (err && err.code) || '';
-  if (code === 'CredentialsError') {
-    return { status: 401, body: { error: 'Missing credentials' } };
+  const code = (err && (err.code || err.name)) || '';
+  const msg  = err?.message || '';
+
+  // credenciales/firma
+  if (code === 'CredentialsError' || code === 'InvalidAccessKeyId' || code === 'ExpiredToken') {
+    return { status: 401, body: { error: 'Unauthorized', hint: 'Revisa AccessKey/Secret del R2 API Token (no Global API Key)' } };
   }
   if (code === 'SignatureDoesNotMatch' || code === 'AccessDenied') {
-    return { status: 401, body: { error: 'Unauthorized' } };
+    return { status: 401, body: { error: 'Unauthorized', hint: 'Asegura endpoint sin /bucket, region=auto, path-style=true' } };
   }
   if (code === 'Forbidden') {
-    return { status: 403, body: { error: 'Forbidden' } };
+    return { status: 403, body: { error: 'Forbidden', hint: 'Token sin permisos suficientes (Bucket/Object read/write/list/delete)' } };
   }
-  return { status: 500, body: { error: err?.message || 's3_error' } };
+  if (code === 'NoSuchBucket') {
+    return { status: 404, body: { error: 'no_such_bucket', hint: `Bucket "${BUCKET}" inexistente o mal escrito` } };
+  }
+  return { status: 500, body: { error: 's3_error', code, message: msg } };
 }
 
-/* ------------------------------- Rutas ---------------------------------- */
+/* ----------------------------------------------------------------------
+ *  Rutas
+ * -------------------------------------------------------------------- */
 // Salud
 app.get('/api/health', (req, res) =>
   res.json({
     ok: true,
     time: new Date().toISOString(),
     bucket: BUCKET,
-    endpoint: ENDPOINT_HOST || null
+    endpoint: ENDPOINT_URL || null,
+    region: S3_REGION,
+    forcePathStyle: FORCE_PATH
   })
 );
 
@@ -128,6 +158,26 @@ app.get('/api/diag/s3', async (req, res) => {
   } catch (err) {
     const m = mapS3Error(err);
     res.status(m.status).json(m.body);
+  }
+});
+
+// Self-test completo: headBucket + put + delete
+app.get('/api/r2-selftest', async (req, res) => {
+  try {
+    await s3.headBucket({ Bucket: BUCKET }).promise();
+    const testKey = `__selftest__/t-${Date.now()}.txt`;
+    await s3.putObject({ Bucket: BUCKET, Key: testKey, Body: 'ok-mixtli', ContentType: 'text/plain' }).promise();
+    await s3.deleteObject({ Bucket: BUCKET, Key: testKey }).promise();
+    res.json({
+      ok: true,
+      message: 'R2 credentials & config OK',
+      config: { endpoint: ENDPOINT_URL, region: S3_REGION, forcePathStyle: FORCE_PATH, bucket: BUCKET }
+    });
+  } catch (err) {
+    const meta = { name: err?.name, code: err?.code, status: err?.statusCode, message: err?.message };
+    console.error('R2 SELFTEST ERROR:', meta);
+    const m = mapS3Error(err);
+    res.status(m.status).json({ ...m.body, meta });
   }
 });
 
@@ -163,7 +213,7 @@ app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) =>
 
     const manifest = {
       id,
-      version: '2.3.1',
+      version: '2.3.2',
       createdAt: toRFC3339(createdAt),
       expiresAt: toRFC3339(expiresAt),
       totalBytes: total,
@@ -177,9 +227,10 @@ app.post('/api/transfers', upload.array('files', MAX_FILES), async (req, res) =>
       'application/json'
     );
 
-    // Preferir PUBLIC_BASE; si no, el host del backend (Render)
     const viewPath = `/t/${id}`;
-    const backendBase = `${req.protocol}://${req.get('host')}`;
+    const scheme = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.get('host');
+    const backendBase = `${scheme}://${host}`;
     const link = backendBase + viewPath;
     const publicLink = PUBLIC_BASE ? `${PUBLIC_BASE}${viewPath}` : link;
 
@@ -238,7 +289,7 @@ app.get('/api/file/:id/:name', async (req, res) => {
     stream.pipe(res);
   } catch (err) {
     console.error('[file_stream_error]', err);
-    res.status(500).send('error');
+    if (!res.headersSent) res.status(500).send('error');
   }
 });
 
@@ -270,7 +321,7 @@ app.get('/api/transfers/:id/download.zip', async (req, res) => {
       const stream = await getObjectStream(key);
       archive.append(stream, { name: f.name });
     }
-    archive.finalize();
+    await archive.finalize();
   } catch (err) {
     console.error('[zip_error]', err);
     if (!res.headersSent) res.status(500).send('zip_error');
@@ -322,7 +373,7 @@ ${manifest.files.map(f=>`
 `).join('')}
 </div>
 ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transfers/${id}/download.zip">Descargar todo (ZIP)</a></div>` }
-<div class="footer">Mixtli Transfer v2.3.1 — compat: PUBLIC_BASE / PUBLIC_BASE_URL.</div>
+<div class="footer">Mixtli Transfer v2.3.2 — compat: PUBLIC_BASE / PUBLIC_BASE_URL.</div>
 </div></div></body></html>`;
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -334,5 +385,5 @@ ${ expired ? '' : `<div style="margin-top:16px"><a class="btn" href="/api/transf
 });
 
 app.listen(PORT, () => {
-  console.log('Mixtli Transfer backend v2.3.1 listening on', PORT);
+  console.log('Mixtli Transfer backend v2.3.2 listening on', PORT);
 });
