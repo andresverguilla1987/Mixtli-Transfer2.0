@@ -1,6 +1,6 @@
 {
   "name": "mixtli-transfer-backend",
-  "version": "2.3.1-b",
+  "version": "2.3.3",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -8,8 +8,8 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.670.0",
     "archiver": "^7.0.1",
-    "aws-sdk": "^2.1586.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
